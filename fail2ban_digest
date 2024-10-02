@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+
+# fail2ban-digest: an email digest aggregator for fail2ban.
+# Copyright (C) 2017 Enrico Tagliavini <enrico.tagliavini@gmail.com>
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+from datetime import datetime, timedelta, timezone, UTC
+from dbm import gnu as dbm
+from email.message import EmailMessage
+from smtplib import SMTP
+from string import Template
+from time import sleep
+from traceback import print_exc
+
+import argparse
+import atexit
+import errno
+import os
+import socket
+import re
+import sys
+
+db_location = '/var/lib/fail2ban/digest'
+db_creation_date_key = u'db_creation_date'
+db_date_format = '%Y-%m-%d %H:%M:%S'
+default_mail_template = Template('''Hi,\n
+This is a digest email of the ${count} banned IPs between ${creation_date} and ${date_now}:
+
+${digest}
+
+Regards,
+
+Fail2ban Digest
+''')
+default_html_template = Template('''<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {
+      font-family: 'Helvetica Neue', Helvetica, Arial, 'Lucida Grande', sans-serif;
+    }
+
+    table {
+      border-collapse: collapse;
+    }
+
+    td, th {
+      border: 1px solid darkgrey;
+      text-align: left;
+      padding: 6px;
+    }
+
+    td {
+      vertical-align: top;
+    }
+
+    td:last-child {
+      width: 1px;
+      white-space: nowrap;
+    }
+
+    th {
+      background-color: #dddddd;
+    }
+  </style>
+</head>
+<body>
+  <p>Hi,</p>
+  <p>This is a digest email of the <b>${count}</b> banned IPs between <b>${creation_date}</b> and <b>${date_now}</b>:</p>
+  <table>
+    <tr>
+      <th style="text-align: center">#</th>
+      <th style="text-align: center">IPs</th>
+      <th>When</th>
+    </tr>
+${digest}
+  </table>
+  <p>Regards,</p>
+  <p><a href="https://github.com/enricotagliavini/fail2ban-digest">Fail2Ban Digest</a><p>
+</body>
+<html>
+''')
+html_tr_template = Template('''    <tr>
+      <td style="text-align: center">${count}</td>
+      <td style="text-align: right">${ip}</td>
+      <td>${events}</td>
+    </tr>
+''')
+html_error_template = Template('''    <tr>
+      <td colspan="3"><em>${error_msg}</em></td>
+    </tr>
+''')
+
+class Ban:
+	def __init__(self, ip, events):
+		self.ip = ip
+		self.events = []
+		for event in events:
+			self.events.append(utc_to_local(event))
+		self.events.sort
+
+class store_yesno(argparse.Action):
+	def __init__(self, option_strings, dest, nargs = None, **kwargs):
+		if nargs is not None:
+			raise ValueError("nargs not allowed")
+		super(store_yesno, self).__init__(option_strings, dest, nargs = 0, **kwargs)
+
+	def __call__(self, parser, namespace, values, option_string = None):
+		if option_string.startswith('--no-'):
+			setattr(namespace, self.dest, False)
+		else:
+			setattr(namespace, self.dest, True)
+		return
+
+ipv4_re = re.compile(r'^(\d){1,3}\.(\d){1,3}\.(\d){1,3}\.(\d){1,3}$')
+
+def ip_address(string):
+	valid = 2
+	try:
+		socket.inet_pton(socket.AF_INET, string)
+		# this can match also stuff like '4' or '127.1' or '127.1.256'
+		# most likely a typo rather than intentional, so refuse it
+		if ipv4_re.search(string) is None:
+			valid -= 1
+	except socket.error:
+		valid -= 1
+	try:
+		socket.inet_pton(socket.AF_INET6, string)
+	except socket.error:
+		valid -= 1
+	if valid > 0:
+		return string
+	else:
+		raise argparse.ArgumentTypeError('%s is not a valid IPv4 or IPv6 address' % string)
+
+def utc_to_local(date_string):
+	try:
+		return datetime.strptime(date_string, db_date_format).replace(tzinfo=timezone.utc).astimezone().strftime(db_date_format)
+	except ValueError:
+		return date_string
+
+def close_db(db_fd):
+	db_fd.close()
+	atexit.unregister(close_db)
+	return
+
+def db_busy_open(filename, flags, timeout):
+	start = datetime.now(UTC)
+	threshold = timedelta(seconds = timeout)
+	while True:
+		try:
+			db = dbm.open(filename, flags)
+			break
+		except OSError as e:
+			if e.errno == errno.EAGAIN: # errno 11, try again in a moment
+				sleep(1)
+			else:
+				raise e
+		if datetime.now(UTC) - start > threshold:
+			raise TimeoutError(errno.ETIMEDOUT, 'timeout while waiting for database file to be unlocked', filename)
+	atexit.register(close_db, db)
+	return db
+
+def add(db, ip):
+	db = db_busy_open(db_location + '/' + db + '.dbm', 'c', 30)
+	if db_creation_date_key not in db.keys():
+		db[db_creation_date_key] = datetime.now(UTC).strftime(db_date_format).encode('UTF-8')
+	event_date = ('%s, ' % datetime.now(UTC).strftime(db_date_format)).encode('UTF-8')
+	try:
+		db[ip] += event_date
+	except KeyError:
+		db[ip] = event_date
+	close_db(db)
+	return
+
+def digest(db, delete, sort):
+	db_file = db_location + '/' + db + '.dbm'
+	new_db_file = db_location + '/.' + db + '.dbm'
+	try:
+		db = db_busy_open(db_file, 'r', 30)  # this is just a trick to lock the DB, to have a consistent copy
+	except OSError as e:
+		# we raise a RuntimeError instead of an OSError to have prettier output
+		raise RuntimeError('Error while opening database file %s: %s' % (repr(db_file), str(e))) from None
+	if delete:
+		# wipe the DB, leave an empty one so maildigest will find it (if called from cron a failure would mail
+		# the admin)
+		with dbm.open(new_db_file, 'n') as new_db:
+			new_db[db_creation_date_key] = datetime.now(UTC).strftime(db_date_format).encode('UTF-8')
+		os.rename(new_db_file, db_file)
+
+	try:
+		db_creation_date = utc_to_local(db[db_creation_date_key].decode('UTF-8'))
+	except KeyError as e:
+		db_creation_date = 'not found'
+	events_list = []
+	for ip in db.keys():
+		if ip.decode('UTF-8') == db_creation_date_key:
+			continue
+		events_list.append(Ban(ip.decode('UTF-8'), db[ip].decode('UTF-8').split(', ')[:-1]))
+	close_db(db)
+	events_list.sort(key=lambda x: x.events[0]) # sort by date
+	if sort:
+		events_list.sort(key=lambda x: len(x.events), reverse=True)
+	msg = ''
+	msg_html = ''
+	for ban in events_list:
+		msg_html += html_tr_template.substitute(count = len(ban.events), ip = ban.ip, events = '<br>'.join(ban.events))
+		msg += '%3d event(s) for IP %-42s: %s\n' %(len(ban.events), ban.ip, ', '.join(ban.events))
+	return (len(events_list), db_creation_date, msg, msg_html)
+
+def mail_digest(db, mail_to, mail_from, delete, html, quiet, sort):
+	msg = EmailMessage()
+	date_now = datetime.now().strftime(db_date_format)
+	count, creation_date, dgst, dgst_html = digest(db, delete, sort)
+	if dgst == '':
+		if quiet:
+			return
+		else:
+			dgst = '    No ban event recorded for the named time frame.'
+			dgst_html = html_error_template.substitute(error_msg = dgst)
+	msg.set_content(default_mail_template.substitute(
+		count = count,
+		creation_date = creation_date,
+		date_now = date_now,
+		digest = dgst
+	))
+	if html:
+		msg.add_alternative(default_html_template.substitute(
+			count = count,
+			creation_date = creation_date,
+			date_now = date_now,
+			digest = dgst_html
+		), subtype = 'html')
+	msg['To'] = mail_to
+	msg['From'] = mail_from
+	msg['Subject'] = '[Fail2Ban] %s: digest for %s %s' % (db, socket.gethostname(), date_now)
+	mta = SMTP(host = 'localhost')
+	mta.send_message(msg)
+	mta.quit()
+	return
+
+def main(args):
+	if args.cmd == 'add':
+		add(args.database, args.ip)
+	elif args.cmd == 'digest':
+		print(digest(args.database, args.delete, args.sort)[2])
+	elif args.cmd == 'maildigest':
+		mail_digest(args.database, args.to, args.mail_from, args.delete, args.html, args.quiet, args.sort)
+	elif args.cmd is None:
+		print('No action specified')
+	return
+
+if __name__ == '__main__':
+	progname = os.path.basename(sys.argv[0])
+	parser = argparse.ArgumentParser(
+			prog = progname,
+			description = 'Gather fail2ban events to process periodically and generate a digest',
+			epilog = 'use `%s command --help\' to get help about a specific command' % progname,
+	)
+	subparsers = parser.add_subparsers(
+			title = 'available commands',
+			dest = 'cmd',
+		)
+
+	subcommands = {}
+	sc = 'add'
+	subcommands[sc] = subparsers.add_parser(
+			sc,
+			description = 'Add a new event to the DB'
+	)
+	subcommands[sc].add_argument(
+			'database',
+			help = 'database where to store the event'
+	)
+
+	subcommands[sc].add_argument(
+			'ip',
+			type = ip_address,
+			help = 'offending IP address, both IPv4 and IPv6 are accepted'
+	)
+
+	sc = 'digest'
+	subcommands[sc] = subparsers.add_parser(
+			sc,
+			description = 'print database digest to standard output'
+	)
+	subcommands[sc].add_argument(
+			'database',
+			help = 'database to generate the digest from'
+	)
+	subcommands[sc].add_argument(
+			'--delete', '--no-delete',
+			action = store_yesno,
+			default = False,
+			help = 'do / don\'t delete current database, next call to add will create a new empty one'
+	)
+	subcommands[sc].add_argument(
+		'--sort', '--no-sort',
+		action = store_yesno,
+		default = True,
+		help = 'do / don\'t sort the digest by repeat event occurrences.'
+	)
+
+	sc = 'maildigest'
+	subcommands[sc] = subparsers.add_parser(
+			sc,
+			description = 'send database digest via email'
+	)
+	subcommands[sc].add_argument(
+			'database',
+			help = 'database to generate the digest from'
+	)
+	subcommands[sc].add_argument(
+			'--delete', '--no-delete',
+			action = store_yesno,
+			default = True,
+			help = 'do / don\'t delete current database, next call to add will create a new empty one'
+	)
+	subcommands[sc].add_argument(
+		'--html', '--no-html',
+		action = store_yesno,
+		default = False,
+		help = 'do / don\'t send the digest in HTML format.'
+	)
+	subcommands[sc].add_argument(
+			'--mail-from',
+			action = 'store',
+			default = 'Fail2ban at {0} <fail2ban@{0}>'.format(socket.gethostname()),
+			help = 'Use FROM address for the email From header. Default: Fail2ban at {0} <fail2ban@{0}> (automatically detected system hostname)'.format(socket.gethostname())
+	)
+	subcommands[sc].add_argument(
+			'--quiet', '--no-quiet',
+			action = store_yesno,
+			default = False,
+			help = 'do / don\'t send digest if there are no ban events recorded for the named time frame'
+	)
+	subcommands[sc].add_argument(
+		'--sort', '--no-sort',
+		action = store_yesno,
+		default = True,
+		help = 'do / don\'t sort the digest by repeat event occurrences.'
+	)
+	subcommands[sc].add_argument(
+			'--to',
+			action = 'store',
+			default = 'root',
+			help = 'send email to specified user / address. Default is root'
+	)
+
+	args = parser.parse_args(sys.argv[1:])
+	#print(args)
+	try:
+		main(args)
+	except KeyboardInterrupt:
+		sys.exit(1)
+	except Exception:
+		print_exc()
+		sys.exit(1)
+
